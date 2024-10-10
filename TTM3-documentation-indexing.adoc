@@ -1,0 +1,23 @@
+= Status of indexing the TTM3 documentation folder
+
+:doctype: book
+
+Currently, the following files are indexed:
+
+ - from .ttm to letter G
+
+Not all files need to be indexed and/or copied to the local `consume` folder.
+Here are a couple of helper scripts to delete all files that are not `pptx`, `docx`, `xlsx`, `pdf`, `jpg`, `png`, `txt`, `md`
+
+
+== Clean Folders
+[source,powershell]
+----
+include::./clean_folders.ps1[]
+----
+
+== Remove unwanted files
+[source,powershell]
+----
+include::./remove-unwanted-files.ps1[]
+----

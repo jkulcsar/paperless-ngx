@@ -1,0 +1,7 @@
+= Using paperless-ngx to manage your documents
+
+:doctype: book
+
+This project contains the `docker-compose` configuration to run the paperless-ngx document management system.
+
+include::./TTM3-documentation-indexing.adoc[]
