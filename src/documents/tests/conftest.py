@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 import filelock
 import pytest
 from django.contrib.auth import get_user_model
-from pytest_django.fixtures import SettingsWrapper
+from django.contrib.contenttypes.models import ContentType
+from guardian.shortcuts import clear_ct_cache
+from pytest_django.fixtures import Settings
 from rest_framework.test import APIClient
 
 from documents.tests.factories import DocumentFactory
@@ -98,7 +100,7 @@ def sample_doc(
 @pytest.fixture()
 def _search_index(
     tmp_path: Path,
-    settings: SettingsWrapper,
+    settings: Settings,
 ) -> Generator[None, None, None]:
     """Create a temp index directory and point INDEX_DIR at it.
 
@@ -116,7 +118,7 @@ def _search_index(
 
 
 @pytest.fixture()
-def settings_timezone(settings: SettingsWrapper) -> zoneinfo.ZoneInfo:
+def settings_timezone(settings: Settings) -> zoneinfo.ZoneInfo:
     return zoneinfo.ZoneInfo(settings.TIME_ZONE)
 
 
@@ -156,6 +158,19 @@ def user_client(rest_api_client: APIClient, regular_user: UserModelT) -> APIClie
     rest_api_client.force_authenticate(user=regular_user)
     rest_api_client.credentials(HTTP_ACCEPT="application/json; version=10")
     return rest_api_client
+
+
+@pytest.fixture(autouse=True)
+def _clear_content_type_caches() -> None:
+    """Clear Django's ContentType cache and guardian's lru_cache before each test.
+
+    Tests that delete and reinsert ContentType/Permission rows (e.g. the
+    importer) corrupt both caches. Without this fixture a subsequent test on
+    the same xdist worker sees stale ContentType objects and guardian raises
+    MixedContentTypeError.
+    """
+    ContentType.objects.clear_cache()
+    clear_ct_cache()
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Final
 from urllib.parse import urlparse
 
-from compression_middleware.middleware import CompressionMiddleware
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.translation import gettext_lazy as _
 from dotenv import load_dotenv
@@ -96,7 +95,26 @@ MODEL_FILE = get_path_from_env(
     "PAPERLESS_MODEL_FILE",
     DATA_DIR / "classification_model.pickle",
 )
+
+# Minimum confidence (0.0-1.0) for the ML classifier to assign a correspondent,
+# document type, or storage path. 0.0 disables the threshold.
+CLASSIFIER_MATCH_THRESHOLD: Final[float] = get_float_from_env(
+    "PAPERLESS_CLASSIFIER_MATCH_THRESHOLD",
+    0.6,
+)
+MATCH_REGEX_TIMEOUT_SECONDS: Final[float] = get_float_from_env(
+    "PAPERLESS_MATCH_REGEX_TIMEOUT_SECONDS",
+    0.1,
+)
 LLM_INDEX_DIR = DATA_DIR / "llm_index"
+LLM_INDEX_LOCK = LLM_INDEX_DIR / "index.lock"
+# Cross-process read/write lock guarding the LLM index compaction/migration
+# file swap. Readers hold it shared; the swap takes it exclusively so it never
+# runs while a reader connection is open. Must be a SQLite (.db) file.
+LLM_INDEX_RWLOCK = LLM_INDEX_DIR / "llmindex.rwlock.db"
+# Seconds the compaction swap waits for active readers to drain before skipping
+# this cycle (it is a maintenance operation; the next run retries).
+LLM_INDEX_COMPACTION_LOCK_TIMEOUT = 30
 
 LOGGING_DIR = get_path_from_env("PAPERLESS_LOGGING_DIR", DATA_DIR / "log")
 
@@ -186,22 +204,10 @@ MIDDLEWARE = [
     "allauth.account.middleware.AccountMiddleware",
 ]
 
-# Optional to enable compression
+# Optional to enable compression. The subclass leaves server-sent events
+# uncompressed; see paperless.middleware.StreamAwareCompressionMiddleware.
 if get_bool_from_env("PAPERLESS_ENABLE_COMPRESSION", "yes"):  # pragma: no cover
-    MIDDLEWARE.insert(0, "compression_middleware.middleware.CompressionMiddleware")
-
-# Workaround to not compress streaming responses (e.g. chat).
-# See https://github.com/friedelwolff/django-compression-middleware/pull/7
-original_process_response = CompressionMiddleware.process_response
-
-
-def patched_process_response(self, request, response):
-    if getattr(request, "compress_exempt", False):
-        return response
-    return original_process_response(self, request, response)
-
-
-CompressionMiddleware.process_response = patched_process_response
+    MIDDLEWARE.insert(0, "paperless.middleware.StreamAwareCompressionMiddleware")
 
 ROOT_URLCONF = "paperless.urls"
 
@@ -336,6 +342,12 @@ SOCIAL_ACCOUNT_SYNC_GROUPS_CLAIM: Final[str] = os.getenv(
     "PAPERLESS_SOCIAL_ACCOUNT_SYNC_GROUPS_CLAIM",
     "groups",
 )
+SOCIAL_ACCOUNT_SYNC_SUPERUSER_GROUP: Final[str | None] = os.getenv(
+    "PAPERLESS_SOCIAL_ACCOUNT_SYNC_SUPERUSER_GROUP",
+)
+SOCIAL_ACCOUNT_SYNC_STAFF_GROUP: Final[str | None] = os.getenv(
+    "PAPERLESS_SOCIAL_ACCOUNT_SYNC_STAFF_GROUP",
+)
 
 HEADLESS_TOKEN_STRATEGY = "paperless.adapter.DrfTokenStrategy"
 
@@ -452,8 +464,25 @@ def _parse_paperless_url():
 
 PAPERLESS_URL = _parse_paperless_url()
 
+
+def _get_allauth_trusted_proxy_count(trusted_proxies: list[str]) -> int:
+    count = get_int_from_env(
+        "PAPERLESS_ALLAUTH_TRUSTED_PROXY_COUNT",
+        len(trusted_proxies),
+    )
+    if count < 0:
+        raise ImproperlyConfigured(
+            "PAPERLESS_ALLAUTH_TRUSTED_PROXY_COUNT must be zero or greater",
+        )
+    return count
+
+
 # For use with trusted proxies
 TRUSTED_PROXIES = get_list_from_env("PAPERLESS_TRUSTED_PROXIES")
+ALLAUTH_TRUSTED_PROXY_COUNT = _get_allauth_trusted_proxy_count(TRUSTED_PROXIES)
+ALLAUTH_TRUSTED_CLIENT_IP_HEADER = os.getenv(
+    "PAPERLESS_ALLAUTH_TRUSTED_CLIENT_IP_HEADER",
+)
 
 USE_X_FORWARDED_HOST = get_bool_from_env("PAPERLESS_USE_X_FORWARD_HOST", "false")
 USE_X_FORWARDED_PORT = get_bool_from_env("PAPERLESS_USE_X_FORWARD_PORT", "false")
@@ -636,6 +665,7 @@ LOGGING = {
         "kombu": {"handlers": ["file_celery"], "level": "DEBUG"},
         "_granian": {"handlers": ["file_paperless"], "level": "DEBUG"},
         "granian.access": {"handlers": ["file_paperless"], "level": "DEBUG"},
+        "httpx": {"level": "WARNING"},
     },
 }
 
@@ -650,6 +680,11 @@ logging.config.dictConfig(LOGGING)
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html
 
 CELERY_BROKER_URL = _CELERY_REDIS_URL
+CELERY_RESULT_BACKEND = _CELERY_REDIS_URL
+CELERY_RESULT_SERIALIZER = "signed-pickle"
+# Results are only needed for chord synchronization
+# a short TTL avoids Redis memory accumulation.
+CELERY_RESULT_EXPIRES = 3600
 CELERY_TIMEZONE = TIME_ZONE
 
 CELERY_WORKER_HIJACK_ROOT_LOGGER = False
@@ -664,9 +699,18 @@ CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_BROKER_TRANSPORT_OPTIONS = {
     "global_keyprefix": _REDIS_KEY_PREFIX,
 }
+CELERY_RESULT_BACKEND_TRANSPORT_OPTIONS = {
+    "global_keyprefix": _REDIS_KEY_PREFIX,
+}
 
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT: Final[int] = get_int_from_env("PAPERLESS_WORKER_TIMEOUT", 1800)
+
+# https://docs.celeryq.dev/en/stable/userguide/configuration.html#std-setting-task_allow_error_cb_on_chord_header
+# Without this, a failing chord header never triggers the errback, so a mail
+# whose attachments all fail is never recorded and is re-fetched forever.
+# The errback runs once per failed header task, so it must be idempotent.
+CELERY_TASK_ALLOW_ERROR_CB_ON_CHORD_HEADER = True
 
 CELERY_CACHE_BACKEND = "default"
 
@@ -1166,19 +1210,46 @@ WEBHOOKS_ALLOW_INTERNAL_REQUESTS = get_bool_from_env(
 REMOTE_OCR_ENGINE = os.getenv("PAPERLESS_REMOTE_OCR_ENGINE")
 REMOTE_OCR_API_KEY = os.getenv("PAPERLESS_REMOTE_OCR_API_KEY")
 REMOTE_OCR_ENDPOINT = os.getenv("PAPERLESS_REMOTE_OCR_ENDPOINT")
+REMOTE_OCR_MODE = get_choice_from_env(
+    "PAPERLESS_REMOTE_OCR_MODE",
+    {"always", "workflow_only"},
+    default="always",
+)
+REMOTE_OCR_ALLOW_INTERNAL_ENDPOINTS = get_bool_from_env(
+    "PAPERLESS_REMOTE_OCR_ALLOW_INTERNAL_ENDPOINTS",
+    "true",
+)
 
 ################################################################################
 # AI Settings                                                                  #
 ################################################################################
 AI_ENABLED = get_bool_from_env("PAPERLESS_AI_ENABLED", "NO")
-LLM_EMBEDDING_BACKEND = os.getenv(
+LLM_EMBEDDING_BACKEND = get_choice_from_env(
     "PAPERLESS_AI_LLM_EMBEDDING_BACKEND",
-)  # "huggingface" or "openai-like"
+    {"huggingface", "openai-like", "ollama"},
+)
 LLM_EMBEDDING_MODEL = os.getenv("PAPERLESS_AI_LLM_EMBEDDING_MODEL")
-LLM_BACKEND = os.getenv("PAPERLESS_AI_LLM_BACKEND")  # "ollama" or "openai-like"
+LLM_EMBEDDING_ENDPOINT = os.getenv("PAPERLESS_AI_LLM_EMBEDDING_ENDPOINT")
+LLM_EMBEDDING_CHUNK_SIZE = get_int_from_env(
+    "PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE",
+    1024,
+)
+if LLM_EMBEDDING_CHUNK_SIZE < 1:
+    raise ImproperlyConfigured("PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE must be >= 1")
+LLM_CONTEXT_SIZE = get_int_from_env("PAPERLESS_AI_LLM_CONTEXT_SIZE", 8192)
+if LLM_CONTEXT_SIZE < 1:
+    raise ImproperlyConfigured("PAPERLESS_AI_LLM_CONTEXT_SIZE must be >= 1")
+LLM_REQUEST_TIMEOUT = get_int_from_env("PAPERLESS_AI_LLM_REQUEST_TIMEOUT", 120)
+if LLM_REQUEST_TIMEOUT < 1:
+    raise ImproperlyConfigured("PAPERLESS_AI_LLM_REQUEST_TIMEOUT must be >= 1")
+LLM_BACKEND = get_choice_from_env(
+    "PAPERLESS_AI_LLM_BACKEND",
+    {"ollama", "openai-like"},
+)
 LLM_MODEL = os.getenv("PAPERLESS_AI_LLM_MODEL")
 LLM_API_KEY = os.getenv("PAPERLESS_AI_LLM_API_KEY")
 LLM_ENDPOINT = os.getenv("PAPERLESS_AI_LLM_ENDPOINT")
+LLM_OUTPUT_LANGUAGE = os.getenv("PAPERLESS_AI_LLM_OUTPUT_LANGUAGE")
 LLM_ALLOW_INTERNAL_ENDPOINTS = get_bool_from_env(
     "PAPERLESS_AI_LLM_ALLOW_INTERNAL_ENDPOINTS",
     "true",

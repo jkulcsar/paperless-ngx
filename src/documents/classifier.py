@@ -13,12 +13,17 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
     from datetime import datetime
+    from types import TracebackType
+    from typing import BinaryIO
+    from typing import Self
 
     from numpy import ndarray
+    from sklearn.neural_network import MLPClassifier
 
 from django.conf import settings
 from django.core.cache import cache
 from django.core.cache import caches
+from django.db.models import Prefetch
 
 from documents.caching import CACHE_5_MINUTES
 from documents.caching import CACHE_50_MINUTES
@@ -28,8 +33,33 @@ from documents.caching import CLASSIFIER_VERSION_KEY
 from documents.caching import StoredLRUCache
 from documents.models import Document
 from documents.models import MatchingModel
+from documents.models import Tag
+from paperless.signed_pickle import SignedPickleError
+from paperless.signed_pickle import signed_pickle_dumps
+from paperless.signed_pickle import signed_pickle_loads
 
 logger = logging.getLogger("paperless.classifier")
+
+
+def _predict_with_threshold(classifier, X, threshold: float) -> int | None:
+    """
+    Return the predicted class id, or None if:
+    - the prediction is -1 (no match), or
+    - the winning class probability is below the configured threshold.
+
+    Using predict_proba() instead of predict() lets us apply a minimum-confidence
+    cutoff so that uncertain predictions are discarded rather than assigned.
+    """
+    probas = classifier.predict_proba(X)[0]
+    best_idx = int(probas.argmax())
+    best_class = int(classifier.classes_[best_idx])
+
+    if best_class == -1:
+        return None
+    if threshold > 0.0 and probas[best_idx] < threshold:
+        return None
+    return best_class
+
 
 ADVANCED_TEXT_PROCESSING_ENABLED = (
     settings.NLTK_LANGUAGE is not None and settings.NLTK_ENABLED
@@ -40,6 +70,52 @@ read_cache = caches["read-cache"]
 
 RE_DIGIT = re.compile(r"\d")
 RE_WORD = re.compile(r"\b[\w]+\b")  # words that may contain digits
+
+# Documents whose content is fetched per query while training
+_CONTENT_CHUNK_SIZE = 1000
+
+
+class _SignedFileWriter:
+    """
+    Atomically writes a file made of an HMAC signature followed by the data,
+    signing the data as it streams to disk rather than holding it in memory.
+
+    The signature is only known once everything is written, so its space is
+    reserved at the start of the file and filled in on exit. The target is only
+    replaced once the file is complete; on error the partial file is removed.
+    """
+
+    def __init__(self, target: Path, mac: hmac.HMAC) -> None:
+        self._target = target
+        self._temp = target.with_name(f"{target.name}.part")
+        self._mac = mac
+        self._file: BinaryIO
+
+    def __enter__(self) -> Self:
+        self._file = self._temp.open("wb")
+        self._file.write(bytes(self._mac.digest_size))
+        return self
+
+    def write(self, data: bytes | memoryview) -> int:
+        self._mac.update(data)
+        return self._file.write(data)
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            with self._file:
+                if exc_type is None:
+                    self._file.seek(0)
+                    self._file.write(self._mac.digest())
+            if exc_type is None:
+                self._temp.rename(self._target)
+        finally:
+            # A no-op after a successful rename, otherwise removes the partial file
+            self._temp.unlink(missing_ok=True)
 
 
 class IncompatibleClassifierVersionError(Exception):
@@ -99,7 +175,9 @@ class DocumentClassifier:
     # v8 - Added storage path classifier
     # v9 - Changed from hashing to time/ids for re-train check
     # v10 - HMAC-signed model file
-    FORMAT_VERSION = 10
+    # v11 - Use sample_weight for balanced training; predict_proba with threshold;
+    #       drop training-only MLP state before saving
+    FORMAT_VERSION = 11
 
     HMAC_SIZE = 32  # SHA-256 digest length
 
@@ -133,12 +211,28 @@ class DocumentClassifier:
         ).hexdigest()
 
     @staticmethod
-    def _compute_hmac(data: bytes) -> bytes:
-        return hmac.new(
-            settings.SECRET_KEY.encode(),
-            data,
-            sha256,
-        ).digest()
+    def _new_hmac() -> hmac.HMAC:
+        return hmac.new(settings.SECRET_KEY.encode(), digestmod=sha256)
+
+    @staticmethod
+    def _strip_training_state(classifier: MLPClassifier) -> None:
+        """
+        Drop MLPClassifier state which is only used during fit(), never by predict().
+
+        The Adam optimizer keeps two moment arrays the size of the weights, and
+        without early_stopping _best_coefs/_best_intercepts are just a copy of the
+        initial random weights. Together that is 3x the size of the weights, which
+        would otherwise be pickled and loaded along with the model.
+        """
+        del classifier._optimizer
+        del classifier._best_coefs
+        del classifier._best_intercepts
+
+    @staticmethod
+    def _compute_hmac(data: bytes | memoryview) -> bytes:
+        mac = DocumentClassifier._new_hmac()
+        mac.update(data)
+        return mac.digest()
 
     def load(self) -> None:
         from sklearn.exceptions import InconsistentVersionWarning
@@ -148,8 +242,13 @@ class DocumentClassifier:
         if len(raw) <= self.HMAC_SIZE:
             raise ClassifierModelCorruptError
 
-        signature = raw[: self.HMAC_SIZE]
-        data = raw[self.HMAC_SIZE :]
+        # Slice through a memoryview so the (potentially multi-GB) payload is
+        # not copied; hmac and pickle both accept buffers directly.
+        # The whole file is still verified from memory before unpickling, rather
+        # than streamed from disk, so it cannot change between check and load.
+        view = memoryview(raw)
+        signature = view[: self.HMAC_SIZE]
+        data = view[self.HMAC_SIZE :]
 
         if not hmac.compare_digest(signature, self._compute_hmac(data)):
             raise ClassifierModelCorruptError
@@ -194,29 +293,24 @@ class DocumentClassifier:
                 raise IncompatibleClassifierVersionError("sklearn version update")
 
     def save(self) -> None:
-        target_file: Path = settings.MODEL_FILE
-        target_file_temp: Path = target_file.with_suffix(".pickle.part")
-
-        data = pickle.dumps(
-            (
-                self.FORMAT_VERSION,
-                self.last_doc_change_time,
-                self.last_auto_type_hash,
-                self.data_vectorizer,
-                self.tags_binarizer,
-                self.tags_classifier,
-                self.correspondent_classifier,
-                self.document_type_classifier,
-                self.storage_path_classifier,
-            ),
-        )
-
-        signature = self._compute_hmac(data)
-
-        with target_file_temp.open("wb") as f:
-            f.write(signature + data)
-
-        target_file_temp.rename(target_file)
+        # Stream to disk instead of building the payload in memory. Protocol 5+
+        # pickles numpy arrays without copying them (the default is 4 before 3.14).
+        with _SignedFileWriter(settings.MODEL_FILE, self._new_hmac()) as f:
+            pickle.dump(
+                (
+                    self.FORMAT_VERSION,
+                    self.last_doc_change_time,
+                    self.last_auto_type_hash,
+                    self.data_vectorizer,
+                    self.tags_binarizer,
+                    self.tags_classifier,
+                    self.correspondent_classifier,
+                    self.document_type_classifier,
+                    self.storage_path_classifier,
+                ),
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
 
     def train(
         self,
@@ -225,29 +319,48 @@ class DocumentClassifier:
         notify = status_callback if status_callback is not None else lambda _: None
 
         # Get non-inbox documents
-        docs_queryset = (
-            Document.objects.exclude(
-                tags__is_inbox_tag=True,
-            )
-            .select_related("document_type", "correspondent", "storage_path")
-            .prefetch_related("tags")
-            .order_by("pk")
-        )
+        docs_queryset = Document.objects.exclude(
+            tags__is_inbox_tag=True,
+        ).order_by("pk")
 
         # No documents exit to train against
-        if docs_queryset.count() == 0:
+        doc_count = docs_queryset.count()
+        if doc_count == 0:
             raise ValueError("No training data available.")
 
         labels_tags = []
         labels_correspondent = []
         labels_document_type = []
         labels_storage_path = []
+        # Content is fetched separately later, for exactly these documents in this
+        # order, so it never all has to be in memory at once
+        doc_pks: list[int] = []
+        latest_doc_change: datetime | None = None
 
         # Step 1: Extract and preprocess training data from the database.
         logger.debug("Gathering data from database...")
-        notify(f"Gathering data from {docs_queryset.count()} document(s)...")
+        notify(f"Gathering data from {doc_count} document(s)...")
         hasher = sha256()
-        for doc in docs_queryset:
+        for doc in (
+            docs_queryset.defer("content")
+            .select_related("document_type", "correspondent", "storage_path")
+            .prefetch_related(
+                Prefetch(
+                    "tags",
+                    queryset=Tag.objects.filter(
+                        matching_algorithm=MatchingModel.MATCH_AUTO,
+                    )
+                    .order_by("pk")
+                    .only("pk"),
+                    to_attr="auto_tags",
+                ),
+            )
+            .iterator(chunk_size=2000)
+        ):
+            doc_pks.append(doc.pk)
+            if latest_doc_change is None or doc.modified > latest_doc_change:
+                latest_doc_change = doc.modified
+
             y = -1
             dt = doc.document_type
             if dt and dt.matching_algorithm == MatchingModel.MATCH_AUTO:
@@ -262,11 +375,7 @@ class DocumentClassifier:
             hasher.update(y.to_bytes(4, "little", signed=True))
             labels_correspondent.append(y)
 
-            tags: list[int] = list(
-                doc.tags.filter(matching_algorithm=MatchingModel.MATCH_AUTO)
-                .order_by("pk")
-                .values_list("pk", flat=True),
-            )
+            tags: list[int] = [tag.pk for tag in doc.auto_tags]
             for tag in tags:
                 hasher.update(tag.to_bytes(4, "little", signed=True))
             labels_tags.append(tags)
@@ -285,7 +394,6 @@ class DocumentClassifier:
         # Check if retraining is actually required.
         # A document has been updated since the classifier was trained
         # New auto tags, types, correspondent, storage paths exist
-        latest_doc_change = docs_queryset.latest("modified").modified
         if (
             self.last_doc_change_time is not None
             and self.last_doc_change_time >= latest_doc_change
@@ -312,7 +420,7 @@ class DocumentClassifier:
         num_storage_paths: int = len(set(labels_storage_path) | {-1}) - 1
 
         logger.debug(
-            f"{docs_queryset.count()} documents, {num_tags} tag(s), {num_correspondents} correspondent(s), "
+            f"{len(doc_pks)} documents, {num_tags} tag(s), {num_correspondents} correspondent(s), "
             f"{num_document_types} document type(s). {num_storage_paths} storage path(s)",
         )
 
@@ -321,16 +429,33 @@ class DocumentClassifier:
         from sklearn.preprocessing import LabelBinarizer
         from sklearn.preprocessing import MultiLabelBinarizer
 
+        # MLPClassifier does not support class_weight directly
+        # (https://github.com/scikit-learn/scikit-learn/issues/9113), so we use
+        # compute_sample_weight to balance classes during training and prevent
+        # over-represented correspondents from dominating predictions.
+        # https://scikit-learn.org/stable/modules/generated/sklearn.utils.class_weight.compute_sample_weight.html
+        from sklearn.utils.class_weight import compute_sample_weight
+
         # Step 2: vectorize data
         logger.debug("Vectorizing data...")
         notify("Vectorizing document content...")
 
         def content_generator() -> Iterator[str]:
             """
-            Generates the content for documents, but once at a time
+            Generates the content for documents, in the same order as the labels,
+            fetching it a chunk at a time
             """
-            for doc in docs_queryset:
-                yield self.preprocess_content(doc.content, shared_cache=False)
+            for start in range(0, len(doc_pks), _CONTENT_CHUNK_SIZE):
+                chunk = doc_pks[start : start + _CONTENT_CHUNK_SIZE]
+                docs = Document.objects.only("content").order_by().in_bulk(chunk)
+                for pk in chunk:
+                    # A document deleted since its labels were gathered still
+                    # needs a row, so labels and content stay aligned
+                    doc = docs.get(pk)
+                    yield self.preprocess_content(
+                        doc.content if doc is not None else "",
+                        shared_cache=False,
+                    )
 
         self.data_vectorizer = CountVectorizer(
             analyzer="word",
@@ -366,8 +491,9 @@ class DocumentClassifier:
                 self.tags_binarizer = MultiLabelBinarizer()
                 labels_tags_vectorized = self.tags_binarizer.fit_transform(labels_tags)
 
-            self.tags_classifier = MLPClassifier(tol=0.01)
+            self.tags_classifier = MLPClassifier(tol=0.01, random_state=0)
             self.tags_classifier.fit(data_vectorized, labels_tags_vectorized)
+            self._strip_training_state(self.tags_classifier)
         else:
             self.tags_classifier = None
             logger.debug("There are no tags. Not training tags classifier.")
@@ -377,8 +503,13 @@ class DocumentClassifier:
             notify(
                 f"Training correspondent classifier ({num_correspondents} correspondent(s))...",
             )
-            self.correspondent_classifier = MLPClassifier(tol=0.01)
-            self.correspondent_classifier.fit(data_vectorized, labels_correspondent)
+            self.correspondent_classifier = MLPClassifier(tol=0.01, random_state=0)
+            self.correspondent_classifier.fit(
+                data_vectorized,
+                labels_correspondent,
+                sample_weight=compute_sample_weight("balanced", labels_correspondent),
+            )
+            self._strip_training_state(self.correspondent_classifier)
         else:
             self.correspondent_classifier = None
             logger.debug(
@@ -390,8 +521,13 @@ class DocumentClassifier:
             notify(
                 f"Training document type classifier ({num_document_types} type(s))...",
             )
-            self.document_type_classifier = MLPClassifier(tol=0.01)
-            self.document_type_classifier.fit(data_vectorized, labels_document_type)
+            self.document_type_classifier = MLPClassifier(tol=0.01, random_state=0)
+            self.document_type_classifier.fit(
+                data_vectorized,
+                labels_document_type,
+                sample_weight=compute_sample_weight("balanced", labels_document_type),
+            )
+            self._strip_training_state(self.document_type_classifier)
         else:
             self.document_type_classifier = None
             logger.debug(
@@ -403,11 +539,13 @@ class DocumentClassifier:
                 "Training storage paths classifier...",
             )
             notify(f"Training storage path classifier ({num_storage_paths} path(s))...")
-            self.storage_path_classifier = MLPClassifier(tol=0.01)
+            self.storage_path_classifier = MLPClassifier(tol=0.01, random_state=0)
             self.storage_path_classifier.fit(
                 data_vectorized,
                 labels_storage_path,
+                sample_weight=compute_sample_weight("balanced", labels_storage_path),
             )
+            self._strip_training_state(self.storage_path_classifier)
         else:
             self.storage_path_classifier = None
             logger.debug(
@@ -527,33 +665,40 @@ class DocumentClassifier:
         serialized_result = read_cache.get(key)
         if serialized_result is None:
             result = self.data_vectorizer.transform([self.preprocess_content(content)])
-            read_cache.set(key, pickle.dumps(result), CACHE_5_MINUTES)
+            read_cache.set(key, signed_pickle_dumps(result), CACHE_5_MINUTES)
         else:
-            read_cache.touch(key, CACHE_5_MINUTES)
-            result = pickle.loads(serialized_result)
+            try:
+                result = signed_pickle_loads(serialized_result)
+            except SignedPickleError:
+                result = self.data_vectorizer.transform(
+                    [self.preprocess_content(content)],
+                )
+                read_cache.set(key, signed_pickle_dumps(result), CACHE_5_MINUTES)
+            else:
+                read_cache.touch(key, CACHE_5_MINUTES)
         return result
 
     def predict_correspondent(self, content: str) -> int | None:
         if self.correspondent_classifier:
             X = self._vectorize(content)
-            correspondent_id = self.correspondent_classifier.predict(X)
-            if correspondent_id != -1:
-                return correspondent_id
-            else:
-                return None
-        else:
-            return None
+            predicted_id = _predict_with_threshold(
+                self.correspondent_classifier,
+                X,
+                settings.CLASSIFIER_MATCH_THRESHOLD,
+            )
+            return predicted_id
+        return None
 
     def predict_document_type(self, content: str) -> int | None:
         if self.document_type_classifier:
             X = self._vectorize(content)
-            document_type_id = self.document_type_classifier.predict(X)
-            if document_type_id != -1:
-                return document_type_id
-            else:
-                return None
-        else:
-            return None
+            predicted_id = _predict_with_threshold(
+                self.document_type_classifier,
+                X,
+                settings.CLASSIFIER_MATCH_THRESHOLD,
+            )
+            return predicted_id
+        return None
 
     def predict_tags(self, content: str) -> list[int]:
         from sklearn.utils.multiclass import type_of_target
@@ -579,10 +724,10 @@ class DocumentClassifier:
     def predict_storage_path(self, content: str) -> int | None:
         if self.storage_path_classifier:
             X = self._vectorize(content)
-            storage_path_id = self.storage_path_classifier.predict(X)
-            if storage_path_id != -1:
-                return storage_path_id
-            else:
-                return None
-        else:
-            return None
+            predicted_id = _predict_with_threshold(
+                self.storage_path_classifier,
+                X,
+                settings.CLASSIFIER_MATCH_THRESHOLD,
+            )
+            return predicted_id
+        return None

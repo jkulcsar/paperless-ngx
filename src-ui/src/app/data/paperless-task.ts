@@ -12,6 +12,7 @@ export enum PaperlessTaskType {
   ReprocessDocument = 'reprocess_document',
   BuildShareLink = 'build_share_link',
   BulkDelete = 'bulk_delete',
+  ApplyAiSuggestions = 'apply_ai_suggestions',
 }
 
 export enum PaperlessTaskTriggerSource {
@@ -63,4 +64,11 @@ export interface PaperlessTaskSummary {
   last_run: Date | null
   last_success: Date | null
   last_failure: Date | null
+}
+
+export interface PaperlessTaskStatusCounts {
+  all: number
+  needs_attention: number
+  in_progress: number
+  completed: number
 }

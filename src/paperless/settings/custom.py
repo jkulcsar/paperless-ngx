@@ -1,6 +1,7 @@
 import datetime
 import logging
 import os
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +173,15 @@ def parse_beat_schedule() -> dict:
         # Don't add disabled tasks to the schedule
         if value == "disable":
             continue
+        if (
+            task["env_key"] == "PAPERLESS_EMAIL_TASK_CRON"
+            and task["env_key"] not in os.environ
+        ):
+            # Spread default polling across the ten-minute interval.
+            secret = os.environ["PAPERLESS_SECRET_KEY"].encode()
+            offset = int.from_bytes(sha256(secret).digest()) % 10
+            minutes = ",".join(str(minute) for minute in range(offset, 60, 10))
+            value = f"{minutes} * * * *"
         # I find https://crontab.guru/ super helpful
         # crontab(5) format
         #   - five time-and-date fields
@@ -209,12 +219,11 @@ def parse_db_settings(data_dir: Path) -> dict[str, dict[str, Any]]:
     Returns:
         A databases dict suitable for Django DATABASES setting.
     """
-    try:
-        engine = get_choice_from_env(
-            "PAPERLESS_DBENGINE",
-            {"sqlite", "postgresql", "mariadb"},
-        )
-    except ValueError:
+    engine = get_choice_from_env(
+        "PAPERLESS_DBENGINE",
+        {"sqlite", "postgresql", "mariadb"},
+    )
+    if engine is None:
         # MariaDB users already had to set PAPERLESS_DBENGINE, so it was picked up above
         # SQLite users didn't need to set anything
         engine = "postgresql" if "PAPERLESS_DBHOST" in os.environ else "sqlite"
@@ -253,6 +262,9 @@ def parse_db_settings(data_dir: Path) -> dict[str, dict[str, Any]]:
                 "NAME": os.getenv("PAPERLESS_DBNAME", "paperless"),
                 "USER": os.getenv("PAPERLESS_DBUSER", "paperless"),
                 "PASSWORD": os.getenv("PAPERLESS_DBPASS", "paperless"),
+                # Validate pooled connections so a connection closed server-side
+                # is replaced rather than handed out as "the connection is closed".
+                "CONN_HEALTH_CHECKS": True,
             }
 
             base_options = {

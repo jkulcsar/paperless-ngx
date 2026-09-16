@@ -9,8 +9,8 @@
   </button>
   @if (canViewSystemStatus) {
     <button class="btn btn-sm btn-outline-primary position-relative ms-md-5 me-1" (click)="showSystemStatus()"
-      [disabled]="!systemStatus">
-      @if (!systemStatus) {
+      [disabled]="!systemStatus()">
+      @if (!systemStatus()) {
         <div class="spinner-border spinner-border-sm me-2 h-75" role="status"></div>
       } @else {
         <i-bs class="me-2" name="card-checklist"></i-bs>
@@ -37,7 +37,7 @@
 
 <form [formGroup]="settingsForm" (ngSubmit)="saveSettings()">
 
-  <ul ngbNav #nav="ngbNav" (navChange)="onNavChange($event)" [(activeId)]="activeNavID" class="nav-tabs">
+  <ul ngbNav #nav="ngbNav" (navChange)="onNavChange($event)" [activeId]="activeNavID()" (activeIdChange)="activeNavID.set($event)" class="nav-tabs">
     <li [ngbNavItem]="SettingsNavIDs.General">
       <a ngbNavLink i18n>General</a>
       <ng-template ngbNavContent>
@@ -112,6 +112,22 @@
 
                 <pngx-input-check i18n-title title="Use 'slim' sidebar (icons only)" formControlName="slimSidebarEnabled"></pngx-input-check>
 
+                <p class="mb-2 mt-3" i18n>Sidebar items to show:</p>
+                @for (option of sidebarItemOptions; track option.id) {
+                  <div class="form-check">
+                    <input
+                      class="form-check-input"
+                      type="checkbox"
+                      [id]="'sidebar-item-setting-' + option.id"
+                      [checked]="isSidebarItemShown(option.id)"
+                      (change)="toggleSidebarItem(option.id, $event.target.checked)"
+                    />
+                    <label class="form-check-label" [for]="'sidebar-item-setting-' + option.id">
+                      {{ option.label }}
+                    </label>
+                  </div>
+                }
+
               </div>
             </div>
 
@@ -150,10 +166,10 @@
 
             <div class="row mb-3">
               <div class="col-md-3 col-form-label pt-0">
-                <span i18n>Full search links to</span>
+                <label for="searchLink" i18n>Full search links to</label>
               </div>
               <div class="col mb-3">
-                <select class="form-select" formControlName="searchLink">
+                <select id="searchLink" class="form-select" formControlName="searchLink">
                   <option [ngValue]="GlobalSearchType.TITLE_CONTENT" i18n>Title and content search</option>
                   <option [ngValue]="GlobalSearchType.ADVANCED" i18n>Advanced search</option>
                 </select>
@@ -199,10 +215,10 @@
             <h5 i18n>Documents</h5>
             <div class="row mb-3">
               <div class="col-md-3 col-form-label pt-0">
-                <span i18n>Items per page</span>
+                <label for="documentListItemPerPage" i18n>Items per page</label>
               </div>
               <div class="col">
-                <select class="form-select" formControlName="documentListItemPerPage">
+                <select id="documentListItemPerPage" class="form-select" formControlName="documentListItemPerPage">
                   <option [ngValue]="10">10</option>
                   <option [ngValue]="25">25</option>
                   <option [ngValue]="50">50</option>
@@ -234,6 +250,12 @@
             <div class="row">
               <div class="col">
                 <pngx-input-check i18n-title title="Automatically remove inbox tag(s) on save" formControlName="documentEditingRemoveInboxTags"></pngx-input-check>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="col">
+                <pngx-input-check i18n-title title="Automatically request suggestions for inbox documents" i18n-hint hint="If un-checked, suggestions must be requested via the Suggest button." formControlName="documentEditingAutoSuggest"></pngx-input-check>
               </div>
             </div>
 
@@ -274,10 +296,10 @@
             <h5 class="mt-3" i18n>PDF Editor</h5>
             <div class="row">
               <div class="col-md-3 col-form-label pt-0">
-                <span i18n>Default editing mode</span>
+                <label for="pdfEditorDefaultEditMode" i18n>Default editing mode</label>
               </div>
               <div class="col">
-                <select class="form-select" formControlName="pdfEditorDefaultEditMode">
+                <select id="pdfEditorDefaultEditMode" class="form-select" formControlName="pdfEditorDefaultEditMode">
                   <option [ngValue]="PdfEditorEditMode.Create" i18n>Create new document(s)</option>
                   <option [ngValue]="PdfEditorEditMode.Update" i18n>Add document version</option>
                 </select>
@@ -304,7 +326,7 @@
         <div class="row mb-3">
           <div class="col">
             <p i18n>
-              Settings apply to this user account for objects (Tags, Mail Rules, etc. but not documents) created via the web UI.
+              Settings apply to this user account for objects (Tags, Mail Rules, etc.) created via the web UI. These settings do not apply to documents.
             </p>
           </div>
         </div>
@@ -313,7 +335,7 @@
             <span i18n>Default Owner</span>
           </div>
           <div class="col-md-5">
-            <pngx-input-select [items]="users" bindLabel="username" formControlName="defaultPermsOwner" [allowNull]="true"></pngx-input-select>
+            <pngx-input-select [items]="users()" bindLabel="username" formControlName="defaultPermsOwner" [allowNull]="true"></pngx-input-select>
             <small class="form-text text-muted text-end d-block mt-n2" i18n>Objects without an owner can be viewed and edited by all users</small>
           </div>
         </div>

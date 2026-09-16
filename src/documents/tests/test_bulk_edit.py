@@ -3,9 +3,13 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
+import pikepdf
 from django.contrib.auth.models import Group
+from django.contrib.auth.models import Permission
 from django.contrib.auth.models import User
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from guardian.shortcuts import assign_perm
 from guardian.shortcuts import get_groups_with_perms
 from guardian.shortcuts import get_users_with_perms
@@ -18,6 +22,7 @@ from documents.models import Document
 from documents.models import DocumentType
 from documents.models import StoragePath
 from documents.models import Tag
+from documents.permissions import set_permissions_for_objects
 from documents.tests.utils import DirectoriesMixin
 
 
@@ -391,6 +396,11 @@ class TestBulkEdit(DirectoriesMixin, TestCase):
         self.assertFalse(Document.objects.filter(id=self.doc1.id).exists())
         self.assertFalse(Document.objects.filter(id=version.id).exists())
 
+        Document.deleted_objects.get(id=self.doc1.id).restore(strict=False)
+
+        self.assertTrue(Document.objects.filter(id=self.doc1.id).exists())
+        self.assertTrue(Document.objects.filter(id=version.id).exists())
+
     def test_delete_version_document_keeps_root(self) -> None:
         version = Document.objects.create(
             checksum="A-v1",
@@ -509,6 +519,173 @@ class TestBulkEdit(DirectoriesMixin, TestCase):
         )
         self.assertEqual(groups_with_perms.count(), 2)
 
+    @mock.patch("documents.tasks.bulk_update_documents.apply_async")
+    def test_set_permissions_batched_across_document_count(
+        self,
+        m,
+    ) -> None:
+        """
+        GIVEN:
+            - Many documents are being bulk-edited to set permissions at once
+        WHEN:
+            - set_permissions runs over a small batch vs. a much larger one
+        THEN:
+            - Permissions are applied correctly at both scales
+            - Query count does not grow with the number of documents, i.e.
+              each user/group is applied across all documents with one
+              batched call rather than one call per (document, identity)
+              pair
+        """
+        permissions = {
+            "view": {
+                "users": [self.user1.id, self.user2.id],
+                "groups": [self.group2.id],
+            },
+            "change": {
+                "users": [self.user1.id],
+                "groups": [self.group2.id],
+            },
+        }
+
+        def run_with_n_documents(n: int) -> int:
+            docs = [
+                Document.objects.create(checksum=f"perm-{n}-{i}", title=f"perm-{n}-{i}")
+                for i in range(n)
+            ]
+            with CaptureQueriesContext(connection) as ctx:
+                bulk_edit.set_permissions(
+                    [doc.id for doc in docs],
+                    set_permissions=permissions,
+                    owner=self.owner,
+                    merge=False,
+                )
+            for doc in docs:
+                self.assertEqual(get_users_with_perms(doc).count(), 2)
+                self.assertEqual(get_groups_with_perms(doc).count(), 1)
+            return len(ctx.captured_queries)
+
+        small_batch_queries = run_with_n_documents(5)
+        large_batch_queries = run_with_n_documents(50)
+
+        # A tolerance rather than equality, matching the N+1 check in
+        # test_views.py: bulk_create's batch_size caps rows per INSERT, so a
+        # large enough selection does legitimately add statements, and the
+        # per-process ContentType cache makes the first run carry an extra
+        # query. Neither can hide a regression to per-document assignment,
+        # which would be ~10x the small-batch count here.
+        self.assertLessEqual(
+            large_batch_queries,
+            small_batch_queries + 5,
+            "Permission assignment appears to scale with document count: "
+            f"{small_batch_queries} queries for 5 documents vs. "
+            f"{large_batch_queries} for 50",
+        )
+
+    @mock.patch("documents.tasks.bulk_update_documents.apply_async")
+    def test_set_permissions_grants_direct_perm_even_if_already_granted_via_group(
+        self,
+        m,
+    ) -> None:
+        """
+        GIVEN:
+            - A user already has view access to a document via group
+              membership, with no direct grant of their own
+        WHEN:
+            - set_permissions explicitly grants that same user direct view
+              access via bulk_edit
+        THEN:
+            - A direct permission grant is created for the user, not skipped
+              because they already have equivalent access via the group
+
+        Regression test: guardian's queryset-aware assign_perm() (routed to
+        when the target is a list/queryset) skips creating a direct row for
+        anyone whose ObjectPermissionChecker.has_perm() already returns True
+        -- which includes group-derived access. The single-object assign_perm
+        this bulk path replaces has no such check; it always ensures a
+        direct row via get_or_create. Losing that guarantee would mean
+        revoking the group's grant later silently strips access that was
+        supposed to be explicit.
+        """
+        self.doc1.owner = self.user1
+        self.doc1.save()
+        self.user1.groups.add(self.group1)
+        assign_perm("view_document", self.group1, self.doc1)
+
+        bulk_edit.set_permissions(
+            [self.doc1.id],
+            set_permissions={
+                "view": {"users": [self.user1.id], "groups": []},
+            },
+            merge=True,
+        )
+
+        direct_users = get_users_with_perms(
+            self.doc1,
+            only_with_perms_in=["view_document"],
+            with_group_users=False,
+        )
+        self.assertIn(self.user1, direct_users)
+
+    def test_set_permissions_for_objects_raises_for_unknown_action(self) -> None:
+        """
+        GIVEN:
+            - An unrecognized permission action name with users to grant it
+              to
+        WHEN:
+            - set_permissions_for_objects is called
+        THEN:
+            - Permission.DoesNotExist is raised, not a silent no-op
+
+        The API rejects unknown action names before they get here, but a
+        direct caller could still pass one. Resolving the Permission via a
+        bare `.filter()` (which returns empty instead of raising) would
+        silently drop the grant and report success.
+        """
+        with self.assertRaises(Permission.DoesNotExist):
+            set_permissions_for_objects(
+                {"not_a_real_action": {"users": [self.user1.id], "groups": []}},
+                Document,
+                [self.doc1.pk],
+            )
+
+    def test_set_permissions_for_objects_unknown_action_applies_nothing(
+        self,
+    ) -> None:
+        """
+        GIVEN:
+            - A permissions dict with a valid action ordered ahead of an
+              unrecognized one
+        WHEN:
+            - set_permissions_for_objects is called
+        THEN:
+            - Permission.DoesNotExist is raised
+            - The valid action ahead of it is not applied either
+
+        Every action is resolved before any row is written, so a bad action
+        name cannot leave a half-applied change behind. That matters because
+        BulkEditObjectsView turns this exception into a 400: without the
+        up-front resolution the client would be told the request failed
+        while the leading action had already been committed.
+        """
+        with self.assertRaises(Permission.DoesNotExist):
+            set_permissions_for_objects(
+                {
+                    "view": {"users": [self.user1.id], "groups": []},
+                    "not_a_real_action": {"users": [self.user1.id], "groups": []},
+                },
+                Document,
+                [self.doc1.pk],
+            )
+
+        self.assertNotIn(
+            self.user1,
+            get_users_with_perms(
+                self.doc1,
+                only_with_perms_in=["view_document"],
+                with_group_users=False,
+            ),
+        )
+
     @mock.patch("documents.models.Document.delete")
     def test_delete_documents_old_uuid_field(self, m) -> None:
         m.side_effect = Exception("Data too long for column 'transaction_id' at row 1")
@@ -614,6 +791,18 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         )
         self.img_doc.archive_filename = img_doc_archive
         self.img_doc.save()
+
+    @staticmethod
+    def mock_password_required_pdf(
+        mock_open: mock.Mock,
+        fake_pdf: mock.Mock,
+    ) -> None:
+        password_context = mock.MagicMock()
+        password_context.__enter__.return_value = fake_pdf
+        mock_open.side_effect = [
+            pikepdf.PasswordError("password required"),
+            password_context,
+        ]
 
     @mock.patch("documents.tasks.consume_file.s")
     def test_merge(self, mock_consume_file) -> None:
@@ -945,6 +1134,10 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         pages = [[1, 2], [3]]
         self.doc2.archive_serial_number = 200
         self.doc2.save()
+        errback = bulk_edit.restore_archive_serial_numbers_task.s(
+            {self.doc2.id: 200},
+        )
+        mock_chord.return_value.on_error.return_value = mock_chord.return_value
 
         result = bulk_edit.split(doc_ids, pages, delete_originals=True)
         self.assertEqual(result, "OK")
@@ -957,6 +1150,8 @@ class TestPDFActions(DirectoriesMixin, TestCase):
 
         mock_delete_documents.assert_called()
         mock_chord.assert_called_once()
+        mock_chord.return_value.on_error.assert_called_once_with(errback)
+        mock_chord.return_value.apply_async.assert_called_once_with()
 
         delete_documents_args, _ = mock_delete_documents.call_args
         self.assertEqual(
@@ -991,6 +1186,7 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         self.doc2.save()
 
         sig = mock.Mock()
+        sig.on_error.return_value = sig
         sig.apply_async.side_effect = Exception("boom")
         mock_chord.return_value = sig
 
@@ -1256,10 +1452,16 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         operations = [{"page": 1}, {"page": 2}]
         self.doc2.archive_serial_number = 250
         self.doc2.save()
+        errback = bulk_edit.restore_archive_serial_numbers_task.s(
+            {self.doc2.id: 250},
+        )
+        mock_chord.return_value.on_error.return_value = mock_chord.return_value
 
         result = bulk_edit.edit_pdf(doc_ids, operations, delete_original=True)
         self.assertEqual(result, "OK")
         mock_chord.assert_called_once()
+        mock_chord.return_value.on_error.assert_called_once_with(errback)
+        mock_chord.return_value.apply_async.assert_called_once_with()
         self.assertEqual(mock_consume_file.call_args.kwargs["overrides"].asn, 250)
         self.doc2.refresh_from_db()
         self.assertIsNone(self.doc2.archive_serial_number)
@@ -1288,6 +1490,7 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         self.doc2.save()
 
         sig = mock.Mock()
+        sig.on_error.return_value = sig
         sig.apply_async.side_effect = Exception("boom")
         mock_chord.return_value = sig
 
@@ -1434,6 +1637,16 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         mock_group.assert_not_called()
         mock_consume_file.assert_not_called()
 
+    @mock.patch("pikepdf.open")
+    def test_edit_pdf_rejects_invalid_operations(self, mock_open) -> None:
+        for operations in ([], [{"page": 1, "doc": 2**32}]):
+            with self.subTest(operations=operations):
+                with self.assertLogs("paperless.bulk_edit", level="ERROR"):
+                    with self.assertRaisesRegex(ValueError, "index is out of bounds"):
+                        bulk_edit.edit_pdf([self.doc2.id], operations)
+
+        mock_open.assert_not_called()
+
     @mock.patch("documents.bulk_edit.update_document_content_maybe_archive_file.delay")
     @mock.patch("documents.tasks.consume_file.apply_async")
     @mock.patch("documents.bulk_edit.tempfile.mkdtemp")
@@ -1452,6 +1665,7 @@ class TestPDFActions(DirectoriesMixin, TestCase):
 
         fake_pdf = mock.MagicMock()
         fake_pdf.pages = [mock.Mock(), mock.Mock(), mock.Mock()]
+        fake_pdf.is_encrypted = True
 
         def save_side_effect(target_path):
             Path(target_path).write_bytes(b"new pdf content")
@@ -1466,7 +1680,13 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         )
 
         self.assertEqual(result, "OK")
-        mock_open.assert_called_once_with(doc.source_path, password="secret")
+        self.assertEqual(
+            mock_open.call_args_list,
+            [
+                mock.call(doc.source_path),
+                mock.call(doc.source_path, password="secret"),
+            ],
+        )
         fake_pdf.remove_unreferenced_resources.assert_called_once()
         mock_update_document.assert_not_called()
         mock_consume_delay.assert_called_once()
@@ -1479,6 +1699,77 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         )
         self.assertEqual(task_kwargs["input_doc"].root_document_id, doc.id)
         self.assertIsNotNone(task_kwargs["overrides"])
+
+    @mock.patch("documents.tasks.consume_file.apply_async")
+    @mock.patch("documents.bulk_edit.tempfile.mkdtemp")
+    @mock.patch("pikepdf.open")
+    def test_remove_password_update_document_skips_unencrypted_pdf(
+        self,
+        mock_open,
+        mock_mkdtemp,
+        mock_consume_delay,
+    ) -> None:
+        doc = self.doc1
+        fake_pdf = mock.MagicMock()
+        fake_pdf.is_encrypted = False
+        mock_open.return_value.__enter__.return_value = fake_pdf
+
+        result = bulk_edit.remove_password(
+            [doc.id],
+            password="secret",
+            update_document=True,
+        )
+
+        self.assertEqual(result, "OK")
+        mock_open.assert_called_once_with(doc.source_path)
+        fake_pdf.remove_unreferenced_resources.assert_not_called()
+        fake_pdf.save.assert_not_called()
+        mock_mkdtemp.assert_not_called()
+        mock_consume_delay.assert_not_called()
+
+    @mock.patch("documents.bulk_edit.update_document_content_maybe_archive_file.delay")
+    @mock.patch("documents.tasks.consume_file.apply_async")
+    @mock.patch("documents.bulk_edit.tempfile.mkdtemp")
+    @mock.patch("pikepdf.open")
+    def test_remove_password_update_document_uses_source_paths(
+        self,
+        mock_open,
+        mock_mkdtemp,
+        mock_consume_delay,
+        mock_update_document,
+    ) -> None:
+        doc = self.doc1
+        source_file = self.dirs.scratch_dir / "consumption-source.pdf"
+        source_file.write_bytes(b"protected pdf content")
+        temp_dir = self.dirs.scratch_dir / "remove-password-source-file"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        mock_mkdtemp.return_value = str(temp_dir)
+
+        fake_pdf = mock.MagicMock()
+        self.mock_password_required_pdf(mock_open, fake_pdf)
+
+        def save_side_effect(target_path):
+            Path(target_path).write_bytes(b"new pdf content")
+
+        fake_pdf.save.side_effect = save_side_effect
+
+        result = bulk_edit.remove_password(
+            [doc.id],
+            password="secret",
+            update_document=True,
+            source_paths_by_id={doc.id: source_file},
+        )
+
+        self.assertEqual(result, "OK")
+        self.assertEqual(
+            mock_open.call_args_list,
+            [
+                mock.call(source_file),
+                mock.call(source_file, password="secret"),
+            ],
+        )
+        mock_update_document.assert_not_called()
+        mock_consume_delay.assert_called_once()
 
     @mock.patch("documents.data_models.magic.from_file", return_value="application/pdf")
     @mock.patch("documents.tasks.consume_file.apply_async")
@@ -1495,7 +1786,7 @@ class TestPDFActions(DirectoriesMixin, TestCase):
             root_document=self.doc1,
         )
         fake_pdf = mock.MagicMock()
-        mock_open.return_value.__enter__.return_value = fake_pdf
+        self.mock_password_required_pdf(mock_open, fake_pdf)
 
         result = bulk_edit.remove_password(
             [self.doc1.id],
@@ -1505,7 +1796,13 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         )
 
         self.assertEqual(result, "OK")
-        mock_open.assert_called_once_with(self.doc1.source_path, password="secret")
+        self.assertEqual(
+            mock_open.call_args_list,
+            [
+                mock.call(self.doc1.source_path),
+                mock.call(self.doc1.source_path, password="secret"),
+            ],
+        )
         mock_consume_delay.assert_called_once()
 
     @mock.patch("documents.bulk_edit.chord")
@@ -1528,12 +1825,12 @@ class TestPDFActions(DirectoriesMixin, TestCase):
 
         fake_pdf = mock.MagicMock()
         fake_pdf.pages = [mock.Mock(), mock.Mock()]
+        self.mock_password_required_pdf(mock_open, fake_pdf)
 
         def save_side_effect(target_path: Path) -> None:
             target_path.write_bytes(b"password removed")
 
         fake_pdf.save.side_effect = save_side_effect
-        mock_open.return_value.__enter__.return_value = fake_pdf
         mock_group.return_value.delay.return_value = None
 
         user = User.objects.create(username="owner")
@@ -1548,7 +1845,13 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         )
 
         self.assertEqual(result, "OK")
-        mock_open.assert_called_once_with(doc.source_path, password="secret")
+        self.assertEqual(
+            mock_open.call_args_list,
+            [
+                mock.call(doc.source_path),
+                mock.call(doc.source_path, password="secret"),
+            ],
+        )
         mock_consume_file.assert_called_once()
         call_kwargs = mock_consume_file.call_args.kwargs
         consumable_document = call_kwargs["input_doc"]
@@ -1572,6 +1875,43 @@ class TestPDFActions(DirectoriesMixin, TestCase):
     @mock.patch("documents.tasks.consume_file.s")
     @mock.patch("documents.bulk_edit.tempfile.mkdtemp")
     @mock.patch("pikepdf.open")
+    def test_remove_password_skips_unencrypted_pdf_without_queueing(
+        self,
+        mock_open: mock.Mock,
+        mock_mkdtemp: mock.Mock,
+        mock_consume_file: mock.Mock,
+        mock_group: mock.Mock,
+        mock_chord: mock.Mock,
+        mock_delete: mock.Mock,
+    ) -> None:
+        doc = self.doc2
+        fake_pdf = mock.MagicMock()
+        fake_pdf.is_encrypted = False
+        mock_open.return_value.__enter__.return_value = fake_pdf
+
+        result = bulk_edit.remove_password(
+            [doc.id],
+            password="secret",
+            update_document=False,
+            delete_original=True,
+        )
+
+        self.assertEqual(result, "OK")
+        mock_open.assert_called_once_with(doc.source_path)
+        fake_pdf.remove_unreferenced_resources.assert_not_called()
+        fake_pdf.save.assert_not_called()
+        mock_mkdtemp.assert_not_called()
+        mock_consume_file.assert_not_called()
+        mock_group.assert_not_called()
+        mock_chord.assert_not_called()
+        mock_delete.si.assert_not_called()
+
+    @mock.patch("documents.bulk_edit.delete")
+    @mock.patch("documents.bulk_edit.chord")
+    @mock.patch("documents.bulk_edit.group")
+    @mock.patch("documents.tasks.consume_file.s")
+    @mock.patch("documents.bulk_edit.tempfile.mkdtemp")
+    @mock.patch("pikepdf.open")
     def test_remove_password_deletes_original(
         self,
         mock_open: mock.Mock,
@@ -1588,12 +1928,12 @@ class TestPDFActions(DirectoriesMixin, TestCase):
 
         fake_pdf = mock.MagicMock()
         fake_pdf.pages = [mock.Mock(), mock.Mock()]
+        self.mock_password_required_pdf(mock_open, fake_pdf)
 
         def save_side_effect(target_path: Path) -> None:
             target_path.write_bytes(b"password removed")
 
         fake_pdf.save.side_effect = save_side_effect
-        mock_open.return_value.__enter__.return_value = fake_pdf
         mock_chord.return_value.delay.return_value = None
 
         result = bulk_edit.remove_password(
@@ -1605,7 +1945,13 @@ class TestPDFActions(DirectoriesMixin, TestCase):
         )
 
         self.assertEqual(result, "OK")
-        mock_open.assert_called_once_with(doc.source_path, password="secret")
+        self.assertEqual(
+            mock_open.call_args_list,
+            [
+                mock.call(doc.source_path),
+                mock.call(doc.source_path, password="secret"),
+            ],
+        )
         mock_consume_file.assert_called_once()
         mock_group.assert_not_called()
         mock_chord.assert_called_once()
@@ -1622,3 +1968,56 @@ class TestPDFActions(DirectoriesMixin, TestCase):
 
         self.assertIn("wrong password", str(exc.exception))
         self.assertIn("Error removing password from document", cm.output[0])
+
+
+class TestBulkEditReprocess(DirectoriesMixin, TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+
+        self.doc = Document.objects.create(
+            title="test",
+            checksum="A",
+            mime_type="application/pdf",
+        )
+
+    @mock.patch("documents.bulk_edit.update_document_content_maybe_archive_file")
+    def test_reprocess_defaults_to_local(self, mock_task: mock.Mock) -> None:
+        """
+        GIVEN:
+            - A reprocess request that says nothing about remote OCR
+        WHEN:
+            - reprocess is called
+        THEN:
+            - The task is queued without asking for the remote engine
+        """
+        result = bulk_edit.reprocess([self.doc.id])
+
+        self.assertEqual(result, "OK")
+        mock_task.apply_async.assert_called_once()
+        _, kwargs = mock_task.apply_async.call_args
+        self.assertEqual(
+            kwargs["kwargs"],
+            {"document_id": self.doc.id, "remote_ocr": False},
+        )
+
+    @mock.patch("documents.bulk_edit.update_document_content_maybe_archive_file")
+    def test_reprocess_passes_remote_ocr(self, mock_task: mock.Mock) -> None:
+        """
+        GIVEN:
+            - A reprocess request that explicitly asks for remote OCR
+        WHEN:
+            - reprocess is called
+        THEN:
+            - The request is forwarded to the task for every document
+        """
+        other = Document.objects.create(
+            title="test2",
+            checksum="B",
+            mime_type="application/pdf",
+        )
+
+        bulk_edit.reprocess([self.doc.id, other.id], remote_ocr=True)
+
+        self.assertEqual(mock_task.apply_async.call_count, 2)
+        for call in mock_task.apply_async.call_args_list:
+            self.assertTrue(call.kwargs["kwargs"]["remote_ocr"])

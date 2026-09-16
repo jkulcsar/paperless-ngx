@@ -30,7 +30,10 @@ from django.db.models import Model
 from django.db.models.signals import m2m_changed
 from django.db.models.signals import post_save
 from filelock import FileLock
+from guardian.shortcuts import clear_ct_cache
 
+from documents.export.compression import compress_type_readable
+from documents.export.compression import unreadable_method_names
 from documents.file_handling import create_source_path_directory
 from documents.management.commands.base import PaperlessCommand
 from documents.management.commands.mixins import CryptMixin
@@ -385,10 +388,19 @@ class Command(CryptMixin, PaperlessCommand):
                 raise DeserializationError(
                     f"{model.__name__} has no updatable fields; PK-only models are not supported by the importer",
                 )
+            # MySQL/MariaDB support upserts via ON DUPLICATE KEY UPDATE but,
+            # unlike PostgreSQL/SQLite, cannot target a specific unique field
+            # for the conflict -- passing unique_fields there raises
+            # NotSupportedError.
+            unique_fields = (
+                [model._meta.pk.attname]
+                if connection.features.supports_update_conflicts_with_target
+                else None
+            )
             model.objects.bulk_create(  # type: ignore[attr-defined]
                 instances,
                 update_conflicts=True,
-                unique_fields=[model._meta.pk.attname],
+                unique_fields=unique_fields,
                 update_fields=update_fields,
             )
             loaded_models.add(model)
@@ -429,6 +441,12 @@ class Command(CryptMixin, PaperlessCommand):
             self.stdout.write(self.style.ERROR(self._import_error_context_message()))
             raise
 
+        # ContentType/Permission rows were deleted and reinserted above; stale
+        # in-process caches must be invalidated so permission checks use the
+        # new IDs rather than pre-import PKs.
+        ContentType.objects.clear_cache()
+        clear_ct_cache()
+
     def handle(self, *args, **options) -> None:
         logging.getLogger().handlers[0].level = logging.ERROR
 
@@ -444,6 +462,20 @@ class Command(CryptMixin, PaperlessCommand):
         with tempfile.TemporaryDirectory() as tmp_dir:
             if is_zipfile(self.source):
                 with ZipFile(self.source) as zf:
+                    unsupported = {
+                        info.compress_type
+                        for info in zf.infolist()
+                        if not compress_type_readable(info.compress_type)
+                    }
+                    if unsupported:
+                        names = sorted(unreadable_method_names(unsupported))
+                        message = (
+                            f"This archive uses compression this Python version cannot "
+                            f"read ({', '.join(names)})."
+                        )
+                        if "zstd" in names:
+                            message += " zstd archives require Python 3.14+."
+                        raise CommandError(message)
                     zf.extractall(tmp_dir)
                 self.source = Path(tmp_dir)
             self._run_import()

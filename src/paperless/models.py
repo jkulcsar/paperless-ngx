@@ -74,9 +74,27 @@ class ColorConvertChoices(models.TextChoices):
     CMYK = ("CMYK", _("CMYK"))
 
 
+class RemoteOCREngine(models.TextChoices):
+    """
+    Matches to PAPERLESS_REMOTE_OCR_ENGINE
+    """
+
+    AZURE_AI = ("azureai", _("Azure AI Document Intelligence"))
+
+
+class RemoteOCRMode(models.TextChoices):
+    """
+    Matches to PAPERLESS_REMOTE_OCR_MODE
+    """
+
+    ALWAYS = ("always", _("All supported documents"))
+    WORKFLOW_ONLY = ("workflow_only", _("Only when a workflow enables it"))
+
+
 class LLMEmbeddingBackend(models.TextChoices):
     OPENAI_LIKE = ("openai-like", _("OpenAI-compatible"))
     HUGGINGFACE = ("huggingface", _("Huggingface"))
+    OLLAMA = ("ollama", _("Ollama"))
 
 
 class LLMBackend(models.TextChoices):
@@ -286,13 +304,50 @@ class ApplicationConfiguration(AbstractSingletonModel):
     )
 
     """
+    Settings for the remote OCR parser
+    """
+
+    # PAPERLESS_REMOTE_OCR_ENGINE
+    remote_ocr_engine = models.CharField(
+        verbose_name=_("Sets the remote OCR engine"),
+        blank=True,
+        null=True,
+        max_length=32,
+        choices=RemoteOCREngine.choices,
+    )
+
+    # PAPERLESS_REMOTE_OCR_API_KEY
+    remote_ocr_api_key = models.CharField(
+        verbose_name=_("Sets the remote OCR API key"),
+        blank=True,
+        null=True,
+        max_length=1024,
+    )
+
+    # PAPERLESS_REMOTE_OCR_ENDPOINT
+    remote_ocr_endpoint = models.CharField(
+        verbose_name=_("Sets the remote OCR endpoint"),
+        blank=True,
+        null=True,
+        max_length=256,
+    )
+
+    # PAPERLESS_REMOTE_OCR_MODE
+    remote_ocr_mode = models.CharField(
+        verbose_name=_("Sets which documents are sent to the remote OCR engine"),
+        blank=True,
+        null=True,
+        max_length=32,
+        choices=RemoteOCRMode.choices,
+    )
+
+    """
     AI related settings
     """
 
     ai_enabled = models.BooleanField(
         verbose_name=_("Enables AI features"),
         null=True,
-        default=False,
     )
 
     llm_embedding_backend = models.CharField(
@@ -308,6 +363,25 @@ class ApplicationConfiguration(AbstractSingletonModel):
         blank=True,
         null=True,
         max_length=128,
+    )
+
+    llm_embedding_endpoint = models.CharField(
+        verbose_name=_("Sets the LLM embedding endpoint, optional"),
+        blank=True,
+        null=True,
+        max_length=256,
+    )
+
+    llm_embedding_chunk_size = models.PositiveSmallIntegerField(
+        verbose_name=_("Sets the LLM embedding chunk size"),
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
+
+    llm_context_size = models.PositiveIntegerField(
+        verbose_name=_("Sets the LLM context size"),
+        null=True,
+        validators=[MinValueValidator(1)],
     )
 
     llm_backend = models.CharField(
@@ -337,6 +411,19 @@ class ApplicationConfiguration(AbstractSingletonModel):
         blank=True,
         null=True,
         max_length=256,
+    )
+
+    llm_output_language = models.CharField(
+        verbose_name=_("Sets the LLM output language"),
+        blank=True,
+        null=True,
+        max_length=32,
+    )
+
+    llm_request_timeout = models.PositiveSmallIntegerField(
+        verbose_name=_("Sets the LLM timeout in seconds"),
+        null=True,
+        validators=[MinValueValidator(1)],
     )
 
     class Meta:

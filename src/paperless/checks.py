@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import stat
@@ -202,10 +203,10 @@ def check_v3_minimum_upgrade_version(
     **kwargs: object,
 ) -> list[Error]:
     """
-    Enforce that upgrades to v3 must start from v2.20.10.
+    Enforce that upgrades to v3 must start from v2.20.15.
 
     v3 squashes all prior migrations into 0001_squashed and 0002_squashed.
-    If a user skips v2.20.10, the data migration in 1075_workflowaction_order
+    If a user skips v2.20.15, the data migration in 1075_workflowaction_order
     never runs and the squash may apply schema changes against an incomplete
     database state.
     """
@@ -232,19 +233,28 @@ def check_v3_minimum_upgrade_version(
         if {"0001_squashed", "0002_squashed"} & applied:
             return []
 
-        # On v2.20.10 exactly — squash will pick up cleanly from here
+        # On v2.20.15 exactly — squash will pick up cleanly from here
         if "1075_workflowaction_order" in applied:
             return []
 
     except (DatabaseError, OperationalError):
         return []
 
+    logger = logging.getLogger(__name__)
+    last_applied = sorted(applied)[-1] if applied else "(none)"
+    logger.error(
+        "V3 upgrade check failed: last applied documents migration is %r. "
+        "Expected '1075_workflowaction_order' (v2.20.15). "
+        "Ensure you have upgraded to v2.20.15 and run 'manage.py migrate' before upgrading to v3.",
+        last_applied,
+    )
+
     return [
         Error(
             "Cannot upgrade to Paperless-ngx v3 from this version.",
             hint=(
-                "Upgrading to v3 can only be performed from v2.20.10."
-                "Please upgrade to v2.20.10, run migrations, then upgrade to v3."
+                "Upgrading to v3 can only be performed from v2.20.15. "
+                "Please upgrade to v2.20.15, run migrations, then upgrade to v3. "
                 "See https://docs.paperless-ngx.com/setup/#upgrading for details."
             ),
             id="paperless.E002",
@@ -283,7 +293,7 @@ def check_deprecated_db_settings(
                     f"{var_name} is no longer supported and will be removed in v3.2. "
                     f"Set the equivalent option via PAPERLESS_DB_OPTIONS instead. "
                     f'Example: PAPERLESS_DB_OPTIONS=\'{{"{db_option_key}": "<value>"}}\'. '
-                    "See https://docs.paperless-ngx.com/migration/ for the full reference."
+                    "See https://docs.paperless-ngx.com/migration-v3/ for the full reference."
                 ),
                 id="paperless.W001",
             ),
@@ -325,20 +335,6 @@ def check_deprecated_v2_ocr_env_vars(
         )
 
     return warnings
-
-
-@register()
-def check_remote_parser_configured(app_configs: Any, **kwargs: Any) -> list[Error]:
-    if settings.REMOTE_OCR_ENGINE == "azureai" and not (
-        settings.REMOTE_OCR_ENDPOINT and settings.REMOTE_OCR_API_KEY
-    ):
-        return [
-            Error(
-                "Azure AI remote parser requires endpoint and API key to be configured.",
-            ),
-        ]
-
-    return []
 
 
 def get_tesseract_langs():

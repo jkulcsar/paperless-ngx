@@ -6,6 +6,7 @@ import {
   OnDestroy,
   OnInit,
   inject,
+  signal,
 } from '@angular/core'
 import {
   FormControl,
@@ -38,7 +39,12 @@ import {
   SystemStatus,
   SystemStatusItemStatus,
 } from 'src/app/data/system-status'
-import { GlobalSearchType, SETTINGS_KEYS } from 'src/app/data/ui-settings'
+import {
+  GlobalSearchType,
+  HIDEABLE_SIDEBAR_ITEM_IDS,
+  HideableSidebarItemID,
+  SETTINGS_KEYS,
+} from 'src/app/data/ui-settings'
 import { User } from 'src/app/data/user'
 import { IfPermissionsDirective } from 'src/app/directives/if-permissions.directive'
 import { CustomDatePipe } from 'src/app/pipes/custom-date.pipe'
@@ -101,6 +107,14 @@ const documentDetailFieldOptions = [
   { id: DocumentDetailFieldID.Tags, label: $localize`Tags` },
 ]
 
+const sidebarItemLabels: Record<HideableSidebarItemID, string> = {
+  [HideableSidebarItemID.Dashboard]: $localize`Dashboard`,
+  [HideableSidebarItemID.SavedViews]: $localize`Saved Views`,
+  [HideableSidebarItemID.Workflows]: $localize`Workflows`,
+  [HideableSidebarItemID.Mail]: $localize`Mail`,
+  [HideableSidebarItemID.Documentation]: $localize`Documentation`,
+}
+
 @Component({
   selector: 'pngx-settings',
   templateUrl: './settings.component.html',
@@ -141,13 +155,14 @@ export class SettingsComponent
   private systemStatusService = inject(SystemStatusService)
   private savedViewsService = inject(SavedViewService)
 
-  activeNavID: number
+  readonly activeNavID = signal<number>(undefined)
 
   settingsForm = new FormGroup({
     bulkEditConfirmationDialogs: new FormControl(null),
     bulkEditApplyOnClose: new FormControl(null),
     documentListItemPerPage: new FormControl(null),
     slimSidebarEnabled: new FormControl(null),
+    sidebarHiddenItems: new FormControl<HideableSidebarItemID[]>([]),
     darkModeUseSystem: new FormControl(null),
     darkModeEnabled: new FormControl(null),
     darkModeInvertThumbs: new FormControl(null),
@@ -167,6 +182,7 @@ export class SettingsComponent
     pdfEditorDefaultEditMode: new FormControl(null),
     documentEditingRemoveInboxTags: new FormControl(null),
     documentEditingOverlayThumbnail: new FormControl(null),
+    documentEditingAutoSuggest: new FormControl(null),
     documentDetailsHiddenFields: new FormControl([]),
     searchDbOnly: new FormControl(null),
     searchLink: new FormControl(null),
@@ -184,15 +200,16 @@ export class SettingsComponent
 
   store: BehaviorSubject<any>
   storeSub: Subscription
+  sidebarItemsSub: Subscription
   isDirty$: Observable<boolean>
   isDirty: boolean = false
   unsubscribeNotifier: Subject<any> = new Subject()
   savePending: boolean = false
 
-  users: User[]
-  groups: Group[]
+  readonly users = signal<User[]>(undefined)
+  readonly groups = signal<Group[]>(undefined)
 
-  public systemStatus: SystemStatus
+  public readonly systemStatus = signal<SystemStatus>(undefined)
 
   public readonly GlobalSearchType = GlobalSearchType
 
@@ -201,18 +218,24 @@ export class SettingsComponent
   public readonly PdfEditorEditMode = PdfEditorEditMode
 
   public readonly documentDetailFieldOptions = documentDetailFieldOptions
+  public readonly sidebarItemOptions = HIDEABLE_SIDEBAR_ITEM_IDS.map((id) => ({
+    id,
+    label: sidebarItemLabels[id],
+  }))
 
   get systemStatusHasErrors(): boolean {
+    const status = this.systemStatus()
+    if (!status) {
+      return false
+    }
     return (
-      this.systemStatus.database.status === SystemStatusItemStatus.ERROR ||
-      this.systemStatus.tasks.redis_status === SystemStatusItemStatus.ERROR ||
-      this.systemStatus.tasks.celery_status === SystemStatusItemStatus.ERROR ||
-      this.systemStatus.tasks.index_status === SystemStatusItemStatus.ERROR ||
-      this.systemStatus.tasks.classifier_status ===
-        SystemStatusItemStatus.ERROR ||
-      this.systemStatus.tasks.sanity_check_status ===
-        SystemStatusItemStatus.ERROR ||
-      this.systemStatus.websocket_connected === SystemStatusItemStatus.ERROR
+      status.database.status === SystemStatusItemStatus.ERROR ||
+      status.tasks.redis_status === SystemStatusItemStatus.ERROR ||
+      status.tasks.celery_status === SystemStatusItemStatus.ERROR ||
+      status.tasks.index_status === SystemStatusItemStatus.ERROR ||
+      status.tasks.classifier_status === SystemStatusItemStatus.ERROR ||
+      status.tasks.sanity_check_status === SystemStatusItemStatus.ERROR ||
+      status.websocket_connected === SystemStatusItemStatus.ERROR
     )
   }
 
@@ -226,6 +249,10 @@ export class SettingsComponent
 
   constructor() {
     super()
+    this.sidebarItemsSub =
+      this.settings.sidebarHiddenItemsEditingChanged.subscribe((hiddenItems) =>
+        this.settingsForm.controls.sidebarHiddenItems.setValue(hiddenItems)
+      )
     this.settings.settingsSaved.subscribe(() => {
       if (!this.savePending) this.initialize()
       this.savedViewsService.maybeRefreshDocumentCounts()
@@ -246,7 +273,7 @@ export class SettingsComponent
         .pipe(first())
         .subscribe({
           next: (r) => {
-            this.users = r.results
+            this.users.set(r.results)
           },
           error: (e) => {
             this.toastService.showError($localize`Error retrieving users`, e)
@@ -265,7 +292,7 @@ export class SettingsComponent
         .pipe(first())
         .subscribe({
           next: (r) => {
-            this.groups = r.results
+            this.groups.set(r.results)
           },
           error: (e) => {
             this.toastService.showError($localize`Error retrieving groups`, e)
@@ -275,14 +302,21 @@ export class SettingsComponent
 
     this.activatedRoute.paramMap.subscribe((paramMap) => {
       const section = paramMap.get('section')
+      let navID = SettingsNavIDs.General
       if (section) {
         const navIDKey: string = Object.keys(SettingsNavIDs).find(
           (navID) => navID.toLowerCase() == section
         )
         if (navIDKey) {
-          this.activeNavID = SettingsNavIDs[navIDKey]
+          navID = SettingsNavIDs[navIDKey]
         }
       }
+      this.activeNavID.set(navID)
+      this.settings.sidebarHiddenItemsEditing.set(
+        navID === SettingsNavIDs.General
+          ? [...this.settingsForm.controls.sidebarHiddenItems.value]
+          : null
+      )
     })
   }
 
@@ -306,6 +340,7 @@ export class SettingsComponent
         SETTINGS_KEYS.DOCUMENT_LIST_SIZE
       ),
       slimSidebarEnabled: this.settings.get(SETTINGS_KEYS.SLIM_SIDEBAR),
+      sidebarHiddenItems: this.settings.get(SETTINGS_KEYS.SIDEBAR_HIDDEN_ITEMS),
       darkModeUseSystem: this.settings.get(SETTINGS_KEYS.DARK_MODE_USE_SYSTEM),
       darkModeEnabled: this.settings.get(SETTINGS_KEYS.DARK_MODE_ENABLED),
       darkModeInvertThumbs: this.settings.get(
@@ -365,6 +400,9 @@ export class SettingsComponent
       documentEditingOverlayThumbnail: this.settings.get(
         SETTINGS_KEYS.DOCUMENT_EDITING_OVERLAY_THUMBNAIL
       ),
+      documentEditingAutoSuggest: this.settings.get(
+        SETTINGS_KEYS.DOCUMENT_EDITING_AUTO_SUGGEST
+      ),
       documentDetailsHiddenFields: this.settings.get(
         SETTINGS_KEYS.DOCUMENT_DETAILS_HIDDEN_FIELDS
       ),
@@ -383,7 +421,7 @@ export class SettingsComponent
         .navigate(['settings', foundNavIDkey.toLowerCase()])
         .then((navigated) => {
           if (!navigated && this.isDirty) {
-            this.activeNavID = navChangeEvent.activeId
+            this.activeNavID.set(navChangeEvent.activeId)
           } else if (navigated && this.isDirty) {
             this.initialize()
           }
@@ -429,16 +467,32 @@ export class SettingsComponent
       this.settingsForm.patchValue(currentFormValue)
     }
 
+    if (this.settings.organizingSidebarItems()) {
+      this.settings.sidebarHiddenItemsEditing.set([
+        ...this.settingsForm.controls.sidebarHiddenItems.value,
+      ])
+    }
+
     if (this.canViewSystemStatus) {
       this.systemStatusService.get().subscribe((status) => {
-        this.systemStatus = status
+        this.systemStatus.set(status)
       })
     }
   }
 
   ngOnDestroy() {
+    this.settings.sidebarHiddenItemsEditing.set(null)
     if (this.isDirty) this.settings.updateAppearanceSettings() // in case user changed appearance but didn't save
     this.storeSub && this.storeSub.unsubscribe()
+    this.sidebarItemsSub.unsubscribe()
+  }
+
+  isSidebarItemShown(item: HideableSidebarItemID): boolean {
+    return !(this.settingsForm.value.sidebarHiddenItems || []).includes(item)
+  }
+
+  toggleSidebarItem(item: HideableSidebarItemID, checked: boolean): void {
+    this.settings.updateSidebarItemVisibility(item, checked)
   }
 
   public saveSettings() {
@@ -465,6 +519,10 @@ export class SettingsComponent
     this.settings.set(
       SETTINGS_KEYS.SLIM_SIDEBAR,
       this.settingsForm.value.slimSidebarEnabled
+    )
+    this.settings.set(
+      SETTINGS_KEYS.SIDEBAR_HIDDEN_ITEMS,
+      this.settingsForm.value.sidebarHiddenItems
     )
     this.settings.set(
       SETTINGS_KEYS.DARK_MODE_USE_SYSTEM,
@@ -563,6 +621,10 @@ export class SettingsComponent
       this.settingsForm.value.documentEditingOverlayThumbnail
     )
     this.settings.set(
+      SETTINGS_KEYS.DOCUMENT_EDITING_AUTO_SUGGEST,
+      this.settingsForm.value.documentEditingAutoSuggest
+    )
+    this.settings.set(
       SETTINGS_KEYS.DOCUMENT_DETAILS_HIDDEN_FIELDS,
       this.settingsForm.value.documentDetailsHiddenFields
     )
@@ -621,6 +683,11 @@ export class SettingsComponent
 
   reset() {
     this.settingsForm.patchValue(this.store.getValue())
+    if (this.settings.organizingSidebarItems()) {
+      this.settings.sidebarHiddenItemsEditing.set([
+        ...this.settingsForm.controls.sidebarHiddenItems.value,
+      ])
+    }
   }
 
   clearThemeColor() {
@@ -664,6 +731,6 @@ export class SettingsComponent
         size: 'xl',
       }
     )
-    modal.componentInstance.status = this.systemStatus
+    modal.componentInstance.status.set(this.systemStatus())
   }
 }

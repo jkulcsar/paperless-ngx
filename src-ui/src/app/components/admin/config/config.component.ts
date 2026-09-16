@@ -69,13 +69,26 @@ export class ConfigComponent
   public configForm = new FormGroup({})
 
   public errors = {}
+  public externallyConfiguredVariables = new Set<string>()
 
   get optionCategories(): string[] {
     return Object.values(ConfigCategory)
   }
 
-  getCategoryOptions(category: string): ConfigOption[] {
-    return PaperlessConfigOptions.filter((o) => o.category === category)
+  getCategorySections(category: string): string[] {
+    return [
+      ...new Set(
+        PaperlessConfigOptions.filter((o) => o.category === category).map(
+          (o) => o.section ?? null // null means no section
+        )
+      ),
+    ]
+  }
+
+  getCategoryOptions(category: string, section: string = null): ConfigOption[] {
+    return PaperlessConfigOptions.filter(
+      (o) => o.category === category && (o.section ?? null) === section
+    )
   }
 
   initialConfig: PaperlessConfig
@@ -97,11 +110,11 @@ export class ConfigComponent
       .pipe(takeUntil(this.unsubscribeNotifier))
       .subscribe({
         next: (config) => {
-          this.loading = false
+          this.loading.set(false)
           this.initialize(config)
         },
         error: (e) => {
-          this.loading = false
+          this.loading.set(false)
           this.toastService.showError($localize`Error retrieving config`, e)
         },
       })
@@ -140,6 +153,9 @@ export class ConfigComponent
   }
 
   private initialize(config: PaperlessConfig) {
+    this.externallyConfiguredVariables = new Set(
+      config.externally_configured_variables ?? []
+    )
     if (!this.store) {
       this.store = new BehaviorSubject(config)
 
@@ -150,7 +166,9 @@ export class ConfigComponent
           this.configForm.patchValue(state, { emitEvent: false })
         })
 
-      this.isDirty$ = dirtyCheck(this.configForm, this.store.asObservable())
+      this.isDirty$ = dirtyCheck(this.configForm, this.store.asObservable(), {
+        excludeKeys: ['externally_configured_variables'],
+      })
     }
     this.configForm.patchValue(config)
 
@@ -162,20 +180,20 @@ export class ConfigComponent
   }
 
   public saveConfig() {
-    this.loading = true
+    this.loading.set(true)
     this.configService
       .saveConfig(this.configForm.value as PaperlessConfig)
       .pipe(takeUntil(this.unsubscribeNotifier), first())
       .subscribe({
         next: (config) => {
-          this.loading = false
+          this.loading.set(false)
           this.initialize(config)
           this.store.next(config)
           this.settingsService.initializeSettings().subscribe()
           this.toastService.showInfo($localize`Configuration updated`)
         },
         error: (e) => {
-          this.loading = false
+          this.loading.set(false)
           this.toastService.showError(
             $localize`An error occurred updating configuration`,
             e
@@ -189,20 +207,20 @@ export class ConfigComponent
   }
 
   public uploadFile(file: File, key: string) {
-    this.loading = true
+    this.loading.set(true)
     this.configService
       .uploadFile(file, this.configForm.value['id'], key)
       .pipe(takeUntil(this.unsubscribeNotifier), first())
       .subscribe({
         next: (config) => {
-          this.loading = false
+          this.loading.set(false)
           this.initialize(config)
           this.store.next(config)
           this.settingsService.initializeSettings().subscribe()
           this.toastService.showInfo($localize`File successfully updated`)
         },
         error: (e) => {
-          this.loading = false
+          this.loading.set(false)
           this.toastService.showError(
             $localize`An error occurred uploading file`,
             e
@@ -213,6 +231,10 @@ export class ConfigComponent
 
   public isSet(key: string): boolean {
     return this.configForm.get(key).value != null
+  }
+
+  public isExternallyConfigured(configKey: string): boolean {
+    return this.externallyConfiguredVariables.has(configKey)
   }
 
   public resetOption(key: string) {
